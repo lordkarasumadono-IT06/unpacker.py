@@ -74,6 +74,4 @@ The script checks (in order):
 3. **Windows only**: is the parent process `explorer.exe`? → double-click
 4. Fallback: `stdin` is not a TTY → double-click
 
-## License
 
-MIT
