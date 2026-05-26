@@ -26,9 +26,9 @@ Drop `unpackerfolder.py` into any folder that contains archives, then **double-c
 ### From a terminal
 
 ```bash
-python unpackerfolder.py            # same as double-click: auto COPY mode
-python unpackerfolder.py --interactive   # full menu (Copy / Replace / Quit)
-python unpackerfolder.py -i              # short alias for --interactive
+py unpackerfolder.py            # same as double-click: auto COPY mode
+py unpackerfolder.py --interactive   # full menu (Copy / Replace / Quit)
+py unpackerfolder.py -i              # short alias for --interactive
 ```
 
 You can also force interactive mode by setting an environment variable:
