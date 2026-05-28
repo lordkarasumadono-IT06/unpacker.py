@@ -3,27 +3,13 @@
 unpackerfolder.py
 Scans the current folder, detects archives and EPUBs, and extracts them.
 Supports: .zip .cbz .cbr .7z .rar .tar .gz .bz2 .xz .zst .epub
-
-Double-click behaviour
-----------------------
-If the script is launched by double-clicking (i.e. no interactive terminal is
-attached, or the env-var UNPACKER_INTERACTIVE=1 is NOT set), it runs
-automatically in COPY mode, prints all progress to the console / a log window,
-and closes the terminal when finished.
-
-To force the interactive menu (useful when launching from an already-open
-terminal), either:
-  - set the environment variable  UNPACKER_INTERACTIVE=1
-  - pass the flag               --interactive  (or  -i)
 """
 
-import os
 import sys
 import shutil
 import zipfile
 import tarfile
 import subprocess
-import time
 from pathlib import Path
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -34,114 +20,24 @@ EPUB_EXTS    = {".epub"}
 IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp",
                 ".bmp", ".tiff", ".tif", ".avif", ".svg"}
 
-# ── double-click detection ───────────────────────────────────────────────────
-
-def _is_double_click() -> bool:
-    """
-    Return True when the script was launched by double-clicking rather than
-    from an already-open terminal session.
-
-    Logic:
-      1. UNPACKER_INTERACTIVE=1  or  --interactive / -i  ->  always False
-      2. Windows: walk the process-parent chain upward.
-           - If we hit explorer.exe before any known terminal  ->  True
-           - If we hit a terminal (cmd, powershell, wt, ...)   ->  False
-      3. Non-Windows fallback: stdin is not a TTY              ->  True
-    """
-    # 1 - explicit overrides
-    if os.environ.get("UNPACKER_INTERACTIVE", "").strip() == "1":
-        return False
-    if "--interactive" in sys.argv or "-i" in sys.argv:
-        return False
-
-    # 2 - Windows: walk the full parent-process chain
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import ctypes.wintypes
-
-            TH32CS_SNAPPROCESS = 0x00000002
-
-            class PROCESSENTRY32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize",              ctypes.wintypes.DWORD),
-                    ("cntUsage",            ctypes.wintypes.DWORD),
-                    ("th32ProcessID",       ctypes.wintypes.DWORD),
-                    ("th32DefaultHeapID",   ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID",        ctypes.wintypes.DWORD),
-                    ("cntThreads",          ctypes.wintypes.DWORD),
-                    ("th32ParentProcessID", ctypes.wintypes.DWORD),
-                    ("pcPriClassBase",      ctypes.c_long),
-                    ("dwFlags",             ctypes.wintypes.DWORD),
-                    ("szExeFile",           ctypes.c_char * 260),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-
-            # Build a {pid: (parent_pid, exe_name)} map from the snapshot
-            snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            proc_map: dict[int, tuple[int, str]] = {}
-            entry = PROCESSENTRY32()
-            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
-            if kernel32.Process32First(snap, ctypes.byref(entry)):
-                while True:
-                    pid  = entry.th32ProcessID
-                    ppid = entry.th32ParentProcessID
-                    name = entry.szExeFile.decode("utf-8", errors="replace").lower()
-                    proc_map[pid] = (ppid, name)
-                    if not kernel32.Process32Next(snap, ctypes.byref(entry)):
-                        break
-            kernel32.CloseHandle(snap)
-
-            # Names that indicate a real interactive terminal
-            TERMINAL_NAMES = {
-                "cmd.exe", "powershell.exe", "pwsh.exe",
-                "windowsterminal.exe", "wt.exe",
-                "mintty.exe", "bash.exe", "zsh.exe", "fish.exe",
-                "alacritty.exe", "conemu64.exe", "conemu.exe",
-                "hyper.exe", "terminus.exe",
-            }
-
-            current_pid = kernel32.GetCurrentProcessId()
-            visited: set[int] = set()
-            pid = current_pid
-
-            while pid and pid not in visited:
-                visited.add(pid)
-                info = proc_map.get(pid)
-                if info is None:
-                    break
-                ppid, _name = info
-                parent_info = proc_map.get(ppid)
-                if parent_info is None:
-                    break
-                parent_name = parent_info[1]
-
-                if "explorer" in parent_name:
-                    return True          # reached explorer -> double-click
-                if parent_name in TERMINAL_NAMES:
-                    return False         # reached a terminal -> interactive
-                pid = ppid
-
-        except Exception:
-            pass
-
-    # 3 - Non-Windows fallback
-    return not sys.stdin.isatty()
-
-
 # ── UI helpers ───────────────────────────────────────────────────────────────
 
 W = 63  # inner width (chars between the two | pipes)
 
-def _bar()               -> str: return "+" + "-" * W + "+"
+def _bar()              -> str: return "+" + "-" * W + "+"
 def _row(text: str = "") -> str: return "| " + text.ljust(W - 2) + " |"
 def _sep(char: str = "-") -> str: return "  " + char * (W - 2)
+
+
+def _spinner(label: str) -> None:
+    """Print an animated spinner on the same line while a subprocess runs."""
+    pass  # used inline via _run_with_spinner
 
 
 # ── tool detection ───────────────────────────────────────────────────────────
 
 def _find_7z() -> str | None:
+    # try PATH first, then common Windows install location
     found = shutil.which("7z") or shutil.which("7z.exe")
     if found:
         return found
@@ -150,13 +46,13 @@ def _find_7z() -> str | None:
         return win_default
     return None
 
-def has_unrar()  -> bool: return bool(shutil.which("unrar"))
+def has_unrar() -> bool: return bool(shutil.which("unrar"))
 def has_patool() -> bool: return bool(shutil.which("patool"))
 
 # ── extraction helpers ───────────────────────────────────────────────────────
 
 def _run(cmd: list[str], label: str) -> None:
-    """Run a subprocess with a live spinner."""
+    """Run a subprocess, printing a live progress indicator."""
     frames = ["|", "/", "-", "\\"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
@@ -168,17 +64,35 @@ def _run(cmd: list[str], label: str) -> None:
         except subprocess.TimeoutExpired:
             print(f"\r    {frames[i % 4]}  {label} ...", end="", flush=True)
             i += 1
-    print(f"\r    ", end="")
+    print(f"\r    ", end="")   # clear spinner line
     if proc.returncode != 0:
         err = (proc.stderr.read() if proc.stderr else "") or ""
         raise RuntimeError(err.strip() or f"exit code {proc.returncode}")
 
 
 def extract_zip_cbz(src: Path, dest: Path) -> None:
+    """
+    Extract a ZIP/CBZ flattening any internal directory structure:
+    every file lands directly in `dest`, regardless of the path stored
+    inside the archive.  Collisions are resolved by appending _1, _2 …
+    """
     with zipfile.ZipFile(src, "r") as zf:
-        total = len(zf.infolist())
-        for i, member in enumerate(zf.infolist(), 1):
-            zf.extract(member, dest)
+        # Skip directory entries; work only with actual files
+        members = [m for m in zf.infolist() if not m.filename.endswith("/")]
+        total = len(members)
+        for i, member in enumerate(members, 1):
+            # Use only the bare filename, discard any internal folders
+            flat_name = Path(member.filename).name
+            target = dest / flat_name
+            # Resolve name collisions
+            if target.exists():
+                stem, sfx = Path(flat_name).stem, Path(flat_name).suffix
+                j = 1
+                while target.exists():
+                    target = dest / f"{stem}_{j}{sfx}"
+                    j += 1
+            with zf.open(member) as sf, open(target, "wb") as df:
+                shutil.copyfileobj(sf, df)
             pct = int(i / total * 100)
             bar = "#" * (pct // 5) + "." * (20 - pct // 5)
             print(f"\r    [{bar}] {pct:3d}%", end="", flush=True)
@@ -188,7 +102,7 @@ def extract_zip_cbz(src: Path, dest: Path) -> None:
 def extract_tar(src: Path, dest: Path) -> None:
     with tarfile.open(src, "r:*") as tf:
         members = tf.getmembers()
-        total   = len(members)
+        total = len(members)
         for i, m in enumerate(members, 1):
             tf.extract(m, dest)
             pct = int(i / total * 100)
@@ -217,15 +131,21 @@ def extract_with_patool(src: Path, dest: Path) -> None:
 
 def extract_rar_cbr(src: Path, dest: Path) -> None:
     errors = []
-    for label, fn in [("7z",     lambda: extract_with_7z(src, dest)),
-                      ("unrar",  lambda: extract_with_unrar(src, dest)),
-                      ("patool", lambda: extract_with_patool(src, dest))]:
-        available = {"7z": _find_7z, "unrar": has_unrar, "patool": has_patool}[label]
-        if available():
-            try:
-                fn(); return
-            except Exception as e:
-                errors.append(f"{label}: {e}")
+    if _find_7z():
+        try:
+            extract_with_7z(src, dest); return
+        except Exception as e:
+            errors.append(f"7z: {e}")
+    if has_unrar():
+        try:
+            extract_with_unrar(src, dest); return
+        except Exception as e:
+            errors.append(f"unrar: {e}")
+    if has_patool():
+        try:
+            extract_with_patool(src, dest); return
+        except Exception as e:
+            errors.append(f"patool: {e}")
     if errors:
         raise RuntimeError("All tools failed:\n" + "\n".join(f"  * {e}" for e in errors))
     raise RuntimeError(
@@ -304,7 +224,7 @@ def scan(root: Path) -> tuple[list[Path], list[Path]]:
     return archives, epubs
 
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 def print_header() -> None:
     print()
@@ -361,7 +281,7 @@ def confirm_replace() -> bool:
     return answer == "DELETE"
 
 
-# ── core extraction run ──────────────────────────────────────────────────────
+# ── main loop ────────────────────────────────────────────────────────────────
 
 def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> None:
     mode_label = "REPLACE" if replace else "COPY"
@@ -381,9 +301,9 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> N
             extract_archive(src, dest)
             if replace:
                 src.unlink()
-                print("         OK  extracted | original deleted")
+                print(f"         OK  extracted | original deleted")
             else:
-                print("         OK  extracted | original kept")
+                print(f"         OK  extracted | original kept")
             ok += 1
         except Exception as exc:
             print(f"         ERROR: {exc}")
@@ -399,7 +319,7 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> N
         try:
             count = extract_epub_images(src, dest)
             if count == 0:
-                print("         WARN  no images found inside epub")
+                print(f"         WARN  no images found inside epub")
                 dest.rmdir()
             else:
                 if replace:
@@ -422,39 +342,11 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> N
     print("  Done.")
 
 
-# ── auto-close helper ────────────────────────────────────────────────────────
-
-def _wait_and_close(seconds: int = 5, had_errors: bool = False) -> None:
-    """
-    When running in double-click mode, pause briefly so the user can read
-    the result, then close the window automatically.
-    If there were errors, pause longer and prompt to press Enter instead.
-    """
-    print()
-    if had_errors:
-        print("  Errors occurred - press Enter to close this window.")
-        try:
-            input()
-        except Exception:
-            pass
-    else:
-        for i in range(seconds, 0, -1):
-            print(f"\r  Window closes in {i}s ...  ", end="", flush=True)
-            time.sleep(1)
-        print()
-
-
-# ── entry point ──────────────────────────────────────────────────────────────
-
 def main() -> None:
     root = Path(__file__).resolve().parent
-    double_click = _is_double_click()
 
     print_header()
     print(f"  Folder: {root}")
-    if double_click:
-        print(_row("  AUTO mode: COPY  (originals kept untouched)"))
-        print(_row("  Launch with --interactive / -i for the full menu."))
 
     archives, epubs = scan(root)
 
@@ -462,19 +354,10 @@ def main() -> None:
         print()
         print("  No archives or EPUB files found. Nothing to do.")
         print()
-        if double_click:
-            _wait_and_close(seconds=4)
         return
 
     print_preview(archives, epubs)
 
-    if double_click:
-        # ── headless COPY mode ──────────────────────────────────────────────
-        run(root, archives, epubs, replace=False)
-        _wait_and_close(seconds=5)
-        return
-
-    # ── interactive menu ────────────────────────────────────────────────────
     while True:
         choice = print_menu()
 
