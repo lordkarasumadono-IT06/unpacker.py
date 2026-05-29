@@ -42,8 +42,14 @@ def is_double_click() -> bool:
     Detection order:
       1. UNPACKER_INTERACTIVE=1  env-var  → NOT a double-click (force interactive)
       2. --interactive / -i flag          → NOT a double-click (force interactive)
-      3. Windows: parent process is explorer.exe → double-click
-      4. Fallback: stdin is not a TTY     → double-click (pipe, scheduled task, …)
+      3. Windows: walk the full ancestor chain looking for explorer.exe.
+         Double-click on Windows creates the chain:
+             explorer.exe → cmd.exe → python.exe
+         so checking only the direct parent is not enough.
+         Known interactive shells (cmd, powershell, wt, pwsh, bash, …) that
+         appear in the chain BEFORE explorer.exe mean the user launched from
+         a terminal → NOT a double-click.
+      4. Fallback: stdin is not a TTY → double-click (pipe, scheduled task, …)
     """
     # 1. env-var override
     if os.environ.get("UNPACKER_INTERACTIVE", "").strip() == "1":
@@ -51,12 +57,19 @@ def is_double_click() -> bool:
     # 2. CLI flag override
     if "--interactive" in sys.argv or "-i" in sys.argv:
         return False
-    # 3. Windows: check parent process name
+    # 3. Windows: walk ancestor chain
     if sys.platform == "win32":
         try:
             import ctypes
             import ctypes.wintypes
+
+            SHELL_PROCS = {"cmd.exe", "powershell.exe", "pwsh.exe",
+                           "windowsterminal.exe", "wt.exe",
+                           "bash.exe", "zsh.exe", "fish.exe",
+                           "mintty.exe", "conhost.exe"}
+
             TH32CS_SNAPPROCESS = 0x00000002
+
             class PROCESSENTRY32(ctypes.Structure):
                 _fields_ = [
                     ("dwSize",              ctypes.wintypes.DWORD),
@@ -70,33 +83,34 @@ def is_double_click() -> bool:
                     ("dwFlags",             ctypes.wintypes.DWORD),
                     ("szExeFile",           ctypes.c_char * 260),
                 ]
-            k32 = ctypes.windll.kernel32
+
+            k32  = ctypes.windll.kernel32
             snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            if snap != ctypes.wintypes.HANDLE(-1).value:
-                current_pid  = os.getpid()
-                parent_pid   = None
-                parent_name  = ""
+            INVALID = ctypes.wintypes.HANDLE(-1).value
+
+            if snap != INVALID:
+                # Build a dict: pid -> (name, parent_pid)
+                procs: dict[int, tuple[str, int]] = {}
                 pe = PROCESSENTRY32()
                 pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                if k32.Process32First(snap, ctypes.byref(pe)):
-                    while True:
-                        if pe.th32ProcessID == current_pid:
-                            parent_pid = pe.th32ParentProcessID
-                        if k32.Process32Next(snap, ctypes.byref(pe)) == 0:
-                            break
-                if parent_pid is not None:
-                    pe2 = PROCESSENTRY32()
-                    pe2.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                    k32.Process32First(snap, ctypes.byref(pe2))
-                    while True:
-                        if pe2.th32ProcessID == parent_pid:
-                            parent_name = pe2.szExeFile.decode(errors="replace").lower()
-                            break
-                        if k32.Process32Next(snap, ctypes.byref(pe2)) == 0:
-                            break
+                ok = k32.Process32First(snap, ctypes.byref(pe))
+                while ok:
+                    name = pe.szExeFile.decode(errors="replace").lower()
+                    procs[pe.th32ProcessID] = (name, pe.th32ParentProcessID)
+                    ok = k32.Process32Next(snap, ctypes.byref(pe))
                 k32.CloseHandle(snap)
-                if "explorer.exe" in parent_name:
-                    return True
+
+                # Walk upward from current process
+                pid = os.getpid()
+                visited: set[int] = set()
+                while pid in procs and pid not in visited:
+                    visited.add(pid)
+                    name, ppid = procs[pid]
+                    if "explorer.exe" in name:
+                        return True          # found explorer before any shell
+                    if name in SHELL_PROCS:
+                        return False         # launched from a real terminal
+                    pid = ppid
         except Exception:
             pass
     # 4. Fallback: stdin is not a TTY
@@ -114,7 +128,7 @@ def auto_close(had_errors: bool) -> None:
     steps = 42   # one tick every 0.1 s
     for i in range(steps):
         remaining = secs - i * (secs / steps)
-        print(f"\r  Chiusura automatica tra {remaining:.1f} s …", end="", flush=True)
+        print(f"\r  Closing automatically in {remaining:.1f} s …", end="", flush=True)
         time.sleep(secs / steps)
     print("\r" + " " * 45)
 
