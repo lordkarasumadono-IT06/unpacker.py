@@ -3,9 +3,20 @@
 unpackerfolder.py
 Scans the current folder, detects archives and EPUBs, and extracts them.
 Supports: .zip .cbz .cbr .7z .rar .tar .gz .bz2 .xz .zst .epub
+
+Double-click behaviour
+  - Starts immediately in COPY mode (no menu)
+  - Errors are printed but execution continues unattended
+  - Terminal closes automatically after 4.2 s when done
+
+Terminal (interactive) behaviour
+  - Full Copy / Replace / Quit menu
+  - On error the run continues; summary shown at the end
 """
 
+import os
 import sys
+import time
 import shutil
 import zipfile
 import tarfile
@@ -19,6 +30,94 @@ ARCHIVE_EXTS = {".zip", ".cbz", ".cbr", ".7z", ".rar",
 EPUB_EXTS    = {".epub"}
 IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp",
                 ".bmp", ".tiff", ".tif", ".avif", ".svg"}
+
+AUTO_CLOSE_SECS = 4.2   # terminal auto-close delay after double-click run
+
+# ── double-click detection ───────────────────────────────────────────────────
+
+def is_double_click() -> bool:
+    """
+    Return True when the script is launched by double-click (not from a shell).
+
+    Detection order:
+      1. UNPACKER_INTERACTIVE=1  env-var  → NOT a double-click (force interactive)
+      2. --interactive / -i flag          → NOT a double-click (force interactive)
+      3. Windows: parent process is explorer.exe → double-click
+      4. Fallback: stdin is not a TTY     → double-click (pipe, scheduled task, …)
+    """
+    # 1. env-var override
+    if os.environ.get("UNPACKER_INTERACTIVE", "").strip() == "1":
+        return False
+    # 2. CLI flag override
+    if "--interactive" in sys.argv or "-i" in sys.argv:
+        return False
+    # 3. Windows: check parent process name
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes
+            TH32CS_SNAPPROCESS = 0x00000002
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize",              ctypes.wintypes.DWORD),
+                    ("cntUsage",            ctypes.wintypes.DWORD),
+                    ("th32ProcessID",       ctypes.wintypes.DWORD),
+                    ("th32DefaultHeapID",   ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID",        ctypes.wintypes.DWORD),
+                    ("cntThreads",          ctypes.wintypes.DWORD),
+                    ("th32ParentProcessID", ctypes.wintypes.DWORD),
+                    ("pcPriClassBase",      ctypes.c_long),
+                    ("dwFlags",             ctypes.wintypes.DWORD),
+                    ("szExeFile",           ctypes.c_char * 260),
+                ]
+            k32 = ctypes.windll.kernel32
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snap != ctypes.wintypes.HANDLE(-1).value:
+                current_pid  = os.getpid()
+                parent_pid   = None
+                parent_name  = ""
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                if k32.Process32First(snap, ctypes.byref(pe)):
+                    while True:
+                        if pe.th32ProcessID == current_pid:
+                            parent_pid = pe.th32ParentProcessID
+                        if k32.Process32Next(snap, ctypes.byref(pe)) == 0:
+                            break
+                if parent_pid is not None:
+                    pe2 = PROCESSENTRY32()
+                    pe2.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                    k32.Process32First(snap, ctypes.byref(pe2))
+                    while True:
+                        if pe2.th32ProcessID == parent_pid:
+                            parent_name = pe2.szExeFile.decode(errors="replace").lower()
+                            break
+                        if k32.Process32Next(snap, ctypes.byref(pe2)) == 0:
+                            break
+                k32.CloseHandle(snap)
+                if "explorer.exe" in parent_name:
+                    return True
+        except Exception:
+            pass
+    # 4. Fallback: stdin is not a TTY
+    return not sys.stdin.isatty()
+
+
+def auto_close(had_errors: bool) -> None:
+    """
+    Print a countdown and exit.  Called only in double-click mode.
+    In double-click mode errors are already printed inline; we never
+    pause for Enter — just count down and close regardless.
+    """
+    print()
+    secs = AUTO_CLOSE_SECS
+    steps = 42   # one tick every 0.1 s
+    for i in range(steps):
+        remaining = secs - i * (secs / steps)
+        print(f"\r  Chiusura automatica tra {remaining:.1f} s …", end="", flush=True)
+        time.sleep(secs / steps)
+    print("\r" + " " * 45)
+
 
 # ── UI helpers ───────────────────────────────────────────────────────────────
 
@@ -283,7 +382,8 @@ def confirm_replace() -> bool:
 
 # ── main loop ────────────────────────────────────────────────────────────────
 
-def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> None:
+def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> bool:
+    """Extract all files. Returns True if any error occurred."""
     mode_label = "REPLACE" if replace else "COPY"
     print()
     print(f"  [ EXTRACTING -- mode: {mode_label} ]")
@@ -340,24 +440,37 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> N
     print(_sep("="))
     print()
     print("  Done.")
+    return errors > 0
 
 
 def main() -> None:
     root = Path(__file__).resolve().parent
+    dbl  = is_double_click()
 
     print_header()
     print(f"  Folder: {root}")
+    if dbl:
+        print(f"  Mode  : auto COPY  (double-click)")
+    print()
 
     archives, epubs = scan(root)
 
     if not archives and not epubs:
-        print()
         print("  No archives or EPUB files found. Nothing to do.")
         print()
+        if dbl:
+            auto_close(had_errors=False)
         return
 
     print_preview(archives, epubs)
 
+    # ── double-click: bypass menu, run COPY immediately ──────────────────
+    if dbl:
+        had_errors = run(root, archives, epubs, replace=False)
+        auto_close(had_errors=had_errors)
+        return
+
+    # ── interactive: full menu ────────────────────────────────────────────
     while True:
         choice = print_menu()
 
