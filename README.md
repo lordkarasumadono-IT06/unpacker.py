@@ -1,6 +1,6 @@
 # unpackerfolder
 
-A zero-dependency Python script that scans a folder, detects archives and EPUBs, and extracts them — all with a live progress bar.
+A zero-dependency Python script that scans a folder, detects archives and EPUBs, and extracts them — all with a live progress bar. Files that were already extracted in a previous run are detected automatically and skipped, so you can safely re-run it on the same folder without duplicating work.
 
 ## Supported formats
 
@@ -12,6 +12,18 @@ A zero-dependency Python script that scans a folder, detects archives and EPUBs,
 | `.7z` | Requires **7-Zip** |
 | `.epub` | Extracts embedded images only (pure Python) |
 
+## Skipping already-extracted files
+
+Before extracting anything, the script checks whether a destination folder with the same name as the archive (or EPUB) already exists **and** already contains files inside it. If so, that file is treated as already extracted and is skipped entirely — nothing is overwritten, re-extracted, or deleted.
+
+This makes it safe to re-run the script on a folder you've already processed: only new archives/EPUBs are extracted, the rest are left untouched.
+
+- Shown in the **preview** as `[already extracted - will be skipped]` next to the file name.
+- Shown during **extraction** as `SKIP folder already contains files (already extracted)`.
+- Counted separately as `Skipped` in the final summary.
+
+If the destination folder exists but is empty, it's *not* considered "already extracted" — the script extracts into it normally.
+
 ## Usage
 
 ### Double-click (Windows / macOS / Linux)
@@ -20,6 +32,7 @@ Drop `unpackerfolder.py` into any folder that contains archives, then **double-c
 
 - Starts **immediately in COPY mode** — no menu, no prompts.
 - Prints a live progress bar for each file.
+- Archives/EPUBs already extracted in a previous run are detected and **skipped automatically**.
 - If an error occurs on one file, it is printed and extraction **continues automatically** with the next file.
 - The terminal window **closes automatically after 4.2 seconds** when all operations are done (whether or not there were errors).
 
@@ -47,7 +60,7 @@ UNPACKER_INTERACTIVE=1 python unpackerfolder.py
 
 Replace mode asks you to type `DELETE` (all caps) as a safety confirmation.
 
-> In interactive mode errors are printed inline and execution always continues; a summary (OK / Errors count) is shown at the end.
+> In interactive mode errors are printed inline and execution always continues; a summary (OK / Skipped / Errors count) is shown at the end.
 
 ## Requirements
 
