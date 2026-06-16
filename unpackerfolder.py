@@ -274,6 +274,18 @@ def _cleanup_if_empty(dest: Path) -> None:
         pass
 
 
+def _already_extracted(dest: Path) -> bool:
+    """
+    True if `dest` exists, is a directory, and already contains at least
+    one entry — meaning the archive/epub has presumably been extracted
+    there already on a previous run.
+    """
+    try:
+        return dest.exists() and dest.is_dir() and any(dest.iterdir())
+    except Exception:
+        return False
+
+
 def extract_archive(src: Path, dest: Path) -> None:
     ext = src.suffix.lower()
     dest.mkdir(parents=True, exist_ok=True)
@@ -346,7 +358,7 @@ def print_header() -> None:
     print(_bar())
 
 
-def print_preview(archives: list[Path], epubs: list[Path]) -> None:
+def print_preview(archives: list[Path], epubs: list[Path], root: Path) -> None:
     total = len(archives) + len(epubs)
     print()
     print(_bar())
@@ -357,13 +369,15 @@ def print_preview(archives: list[Path], epubs: list[Path]) -> None:
         print("  ARCHIVES  (full extraction -> subfolder with same name)")
         print(_sep())
         for f in archives:
-            print(f"    {f.name}")
+            note = "  [already extracted - will be skipped]" if _already_extracted(root / f.stem) else ""
+            print(f"    {f.name}{note}")
     if epubs:
         print()
         print("  EPUB  (images only -> subfolder with same name)")
         print(_sep())
         for f in epubs:
-            print(f"    {f.name}")
+            note = "  [already extracted - will be skipped]" if _already_extracted(root / f.stem) else ""
+            print(f"    {f.name}{note}")
     print()
 
 
@@ -403,14 +417,17 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> b
     print(f"  [ EXTRACTING -- mode: {mode_label} ]")
     print()
 
-    ok = errors = 0
+    ok = errors = skipped = 0
 
     for src in archives:
         dest = root / src.stem
-        if dest.exists():
-            dest = root / (src.stem + "_extracted")
         print(f"  [arc]  {src.name}")
         print(f"         -> {dest.name}/")
+        if _already_extracted(dest):
+            print(f"         SKIP  folder already contains files (already extracted)")
+            skipped += 1
+            print()
+            continue
         try:
             extract_archive(src, dest)
             if replace:
@@ -426,10 +443,13 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> b
 
     for src in epubs:
         dest = root / src.stem
-        if dest.exists():
-            dest = root / (src.stem + "_extracted")
         print(f"  [epub] {src.name}")
         print(f"         -> {dest.name}/")
+        if _already_extracted(dest):
+            print(f"         SKIP  folder already contains files (already extracted)")
+            skipped += 1
+            print()
+            continue
         try:
             count = extract_epub_images(src, dest)
             if count == 0:
@@ -449,6 +469,8 @@ def run(root: Path, archives: list[Path], epubs: list[Path], replace: bool) -> b
 
     print(_sep("="))
     print(f"  Extracted OK : {ok}")
+    if skipped:
+        print(f"  Skipped      : {skipped}")
     if errors:
         print(f"  Errors       : {errors}")
     print(_sep("="))
@@ -476,7 +498,7 @@ def main() -> None:
             auto_close(had_errors=False)
         return
 
-    print_preview(archives, epubs)
+    print_preview(archives, epubs, root)
 
     # ── double-click: bypass menu, run COPY immediately ──────────────────
     if dbl:
